@@ -9,7 +9,7 @@ import asyncio
 import torch
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 from omegaconf import OmegaConf
 from diffusers import AutoencoderKL, DDIMScheduler
 from accelerate.utils import set_seed
@@ -17,6 +17,7 @@ from accelerate.utils import set_seed
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
 from latentsync.whisper.audio2feature import Audio2Feature
+from DeepCache import DeepCacheSDHelper  # Added import for DeepCache
 
 app = FastAPI(title="Audio-Driven Avatar Generation API")
 
@@ -28,6 +29,9 @@ INFERENCE_CKPT_PATH = "checkpoints/latentsync_unet.pt"
 INFERENCE_STEPS = 20
 GUIDANCE_SCALE = 1.0
 SEED = 1247
+# DeepCache parameters
+CACHE_INTERVAL = 3
+CACHE_BRANCH_ID = 0
 
 # Create directories if they don't exist
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -38,8 +42,8 @@ config = OmegaConf.load(CONFIG_PATH)
 
 # Request model for URL-based inputs
 class GenerationRequest(BaseModel):
-    video_url: str  # Changed from HttpUrl to str
-    audio_url: str  # Changed from HttpUrl to str
+    video_url: str
+    audio_url: str
     inference_steps: Optional[int] = INFERENCE_STEPS
     guidance_scale: Optional[float] = GUIDANCE_SCALE
     seed: Optional[int] = SEED
@@ -85,22 +89,30 @@ async def startup_event():
     vae.config.shift_factor = 0
     
     # Initialize UNet
-    denoising_unet, *_ = UNet3DConditionModel.from_pretrained(
+    unet, *_ = UNet3DConditionModel.from_pretrained(
         OmegaConf.to_container(config.model),
         INFERENCE_CKPT_PATH,
         device="cpu",
     )
-    denoising_unet = denoising_unet.to(dtype=dtype)
+    unet = unet.to(dtype=dtype)
     
-    # Initialize pipeline
+    # Initialize pipeline with unet (changed from denoising_unet)
     pipeline = LipsyncPipeline(
         vae=vae,
         audio_encoder=audio_encoder,
-        denoising_unet=denoising_unet,
+        unet=unet,  # Changed from denoising_unet to unet
         scheduler=scheduler,
     ).to(device)
     
-    print("Model initialized successfully!")
+    # Initialize and enable DeepCache
+    helper = DeepCacheSDHelper(pipe=pipeline)
+    helper.set_params(
+        cache_interval=CACHE_INTERVAL,
+        cache_branch_id=CACHE_BRANCH_ID,
+    )
+    helper.enable()
+    
+    print("Model initialized successfully with DeepCache acceleration!")
 
 def cleanup_files(file_paths):
     """Delete temporary files after processing"""
@@ -268,7 +280,6 @@ async def generate_avatar_from_files(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error saving uploaded files: {str(e)}")
     
-    # Rest of the implementation is the same as in the original code
     # Check if files exist
     if not os.path.exists(video_path):
         raise HTTPException(status_code=400, detail=f"Video file could not be saved or accessed")
